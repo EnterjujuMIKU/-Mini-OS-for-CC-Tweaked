@@ -1,2 +1,2 @@
-# -Mini-OS-for-CC-Tweaked
+# Mini-bank-for-CC-Tweaked
 # Independance mod: CC: Tweaked
