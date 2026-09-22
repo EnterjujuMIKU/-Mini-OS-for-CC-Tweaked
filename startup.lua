@@ -1,15 +1,15 @@
 -- ====================================================
--- CraftBank OS - Multi-Ecrans & Multi-Comptes
+-- CraftBank OS - Multi-Ecrans & Horloge Dynamique
 -- ====================================================
 
 -- ====================================================
--- 1. BASE DE DONNEES
+-- 1. BASE DE DONNEES (Par Nom de Compte)
 -- ====================================================
 local dataFile = "bank_data.txt"
 local bankData = {
     accounts = {
-        ["1001"] = { name = "Twilight", pin = "1234", balance = 1500 },
-        ["2002"] = { name = "Joueur2", pin = "0000", balance = 500 }
+        ["Twilight"] = { pin = "1234", balance = 1500 },
+        ["Admin"] = { pin = "0000", balance = 9999 }
     },
     globalHistory = {}
 }
@@ -20,7 +20,6 @@ local function saveData()
         f.write(textutils.serialize(bankData))
         f.close()
     end
-    -- Notifier tous les ecrans qu'une mise a jour a eu lieu
     os.queueEvent("bank_update")
 end
 
@@ -37,6 +36,15 @@ local function loadData()
     end
 end
 
+local function getAccountByName(name)
+    for k, v in pairs(bankData.accounts) do
+        if string.lower(k) == string.lower(name) then
+            return k -- Retourne le vrai nom avec la bonne casse
+        end
+    end
+    return nil
+end
+
 local function logTransaction(accountName, actionText)
     local entry = string.format("[%s] %s: %s", textutils.formatTime(os.time(), true), accountName, actionText)
     table.insert(bankData.globalHistory, entry)
@@ -45,16 +53,10 @@ local function logTransaction(accountName, actionText)
 end
 
 -- ====================================================
--- 2. MOTEUR D'INTERFACE ISOLE (POUR MULTI-ECRANS)
+-- 2. MOTEUR D'INTERFACE ISOLE
 -- ====================================================
--- Permet à chaque écran de fonctionner indépendamment
 local function createContext(target_term, target_name)
-    local ctx = {
-        t = target_term,
-        name = target_name,
-        buttons = {},
-        isColor = target_term.isColor()
-    }
+    local ctx = { t = target_term, name = target_name, buttons = {}, isColor = target_term.isColor() }
     ctx.w, ctx.h = ctx.t.getSize()
     return ctx
 end
@@ -63,9 +65,7 @@ local function clearButtons(ctx) ctx.buttons = {} end
 
 local function addButton(ctx, id, label, x, y, bw, bh, bg, fg, callback)
     table.insert(ctx.buttons, {
-        id = id, label = label,
-        x = x, y = y, w = bw, h = bh,
-        bg = bg, fg = fg, cb = callback
+        id = id, label = label, x = x, y = y, w = bw, h = bh, bg = bg, fg = fg, cb = callback
     })
 end
 
@@ -78,8 +78,7 @@ local function drawButtons(ctx)
             if row == math.floor(b.h / 2) then
                 local lbl = string.sub(b.label, 1, b.w)
                 local padL = math.floor((b.w - #lbl) / 2)
-                local padR = b.w - #lbl - padL
-                ctx.t.write(string.rep(" ", padL) .. lbl .. string.rep(" ", padR))
+                ctx.t.write(string.rep(" ", padL) .. lbl .. string.rep(" ", b.w - #lbl - padL))
             else
                 ctx.t.write(string.rep(" ", b.w))
             end
@@ -89,20 +88,20 @@ end
 
 local function handleTouch(ctx, mx, my)
     for _, b in ipairs(ctx.buttons) do
-        if mx >= b.x and mx <= b.x + b.w - 1 and my >= b.y and my <= b.y + b.h - 1 then
-            return b.cb
-        end
+        if mx >= b.x and mx <= b.x + b.w - 1 and my >= b.y and my <= b.y + b.h - 1 then return b.cb end
     end
     return nil
 end
 
--- Filtre d'events pour eviter qu'un ecran controle l'autre
+-- Filtre asynchrone qui gere l'horloge (bank_tick)
 local function pullCtxEvent(ctx)
     while true do
         local ev = {os.pullEvent()}
         local type = ev[1]
         
-        if type == "mouse_click" and ctx.name == "computer" then
+        if type == "bank_tick" then
+            return "tick"
+        elseif type == "mouse_click" and ctx.name == "computer" then
             return "touch", ev[3], ev[4]
         elseif type == "monitor_touch" and ctx.name == ev[2] then
             return "touch", ev[3], ev[4]
@@ -110,6 +109,12 @@ local function pullCtxEvent(ctx)
             return table.unpack(ev)
         end
     end
+end
+
+local function clr(ctx)
+    ctx.t.setBackgroundColor(ctx.isColor and colors.gray or colors.black)
+    ctx.t.setTextColor(colors.white)
+    ctx.t.clear()
 end
 
 local function drawHeader(ctx, title)
@@ -132,182 +137,227 @@ local function drawFooter(ctx, info)
     ctx.t.write(string.sub(" " .. (info or ""), 1, ctx.w))
 end
 
-local function clr(ctx)
-    ctx.t.setBackgroundColor(ctx.isColor and colors.gray or colors.black)
-    ctx.t.setTextColor(colors.white)
-    ctx.t.clear()
-end
+-- ====================================================
+-- 3. CLAVIER AZERTY (LETTRES POUR NOM)
+-- ====================================================
+local function getAzertyInput(ctx, title, allowCancel)
+    local value, errorMsg = "", ""
+    local kb = {
+        {"A","Z","E","R","T","Y","U","I","O","P"},
+        {"Q","S","D","F","G","H","J","K","L","M"},
+        {"W","X","C","V","B","N","-","_"}
+    }
+    clr(ctx); clearButtons(ctx)
 
--- ====================================================
--- 3. NUMPAD TACTILE
--- ====================================================
-local function getNumpadInput(ctx, title, isMasked, allowCancel)
-    local value = ""
-    local errorMsg = ""
-    local maxLen = 8
+    local bH = 1
+    local gapY = (ctx.h < 16) and 0 or 1
+    local startY = 5
+
+    for r, row in ipairs(kb) do
+        local startX = math.max(1, math.floor((ctx.w - #row) / 2) + 1)
+        for c, keyText in ipairs(row) do
+            addButton(ctx, "k"..keyText, keyText, startX + c - 1, startY + (r-1)*(bH+gapY), 1, bH, (ctx.isColor and colors.cyan or colors.white), colors.black, function() return keyText end)
+        end
+    end
+
+    local lastY = startY + 3 * (bH + gapY)
+    addButton(ctx, "DEL", "DEL", 2, lastY, 4, bH, (ctx.isColor and colors.orange or colors.white), colors.black, function() return "DEL" end)
+    addButton(ctx, "SPC", "ESP", 7, lastY, ctx.w - 12, bH, colors.gray, colors.white, function() return " " end)
+    addButton(ctx, "OK", "OK", ctx.w - 4, lastY, 4, bH, (ctx.isColor and colors.green or colors.white), colors.black, function() return "OK" end)
+    
+    if allowCancel then
+        addButton(ctx, "cancel", "Annuler", 2, lastY + bH + gapY, ctx.w - 3, 1, (ctx.isColor and colors.red or colors.white), colors.white, function() return "CANCEL" end)
+    end
+
+    drawButtons(ctx); drawFooter(ctx, "Saisir Identifiant")
+
+    local function drawField()
+        ctx.t.setCursorPos(2, 3)
+        ctx.t.setBackgroundColor(colors.black); ctx.t.setTextColor(colors.yellow)
+        ctx.t.write(string.sub(" " .. value .. string.rep(" ", math.max(0, ctx.w - 2 - #value - 1)), 1, ctx.w - 2))
+        ctx.t.setCursorPos(2, 4)
+        if errorMsg ~= "" then
+            ctx.t.setTextColor(ctx.isColor and colors.red or colors.white); ctx.t.setBackgroundColor(ctx.isColor and colors.gray or colors.black)
+            ctx.t.write(string.sub(errorMsg .. string.rep(" ", ctx.w), 1, ctx.w - 2))
+        else
+            ctx.t.setBackgroundColor(ctx.isColor and colors.gray or colors.black); ctx.t.write(string.rep(" ", ctx.w - 2))
+        end
+    end
+
+    drawHeader(ctx, title); drawField()
 
     while true do
-        clr(ctx)
-        clearButtons(ctx)
-        drawHeader(ctx, title)
-        drawFooter(ctx, "DEL: Effacer | OK: Valider")
-
-        ctx.t.setCursorPos(2, 3)
-        ctx.t.setBackgroundColor(colors.black)
-        ctx.t.setTextColor(colors.yellow)
-        local dVal = isMasked and string.rep("*", #value) or value
-        local inputStr = " " .. dVal
-        local padded = inputStr .. string.rep(" ", math.max(0, ctx.w - 2 - #inputStr))
-        ctx.t.write(string.sub(padded, 1, ctx.w - 2))
-
-        if errorMsg ~= "" then
-            ctx.t.setCursorPos(2, 4)
-            ctx.t.setTextColor(ctx.isColor and colors.red or colors.white)
-            ctx.t.setBackgroundColor(ctx.isColor and colors.gray or colors.black)
-            ctx.t.write(string.sub(errorMsg, 1, ctx.w - 2))
-        end
-
-        local btnW = math.floor((ctx.w - 4) / 3)
-        local bH = (ctx.h < 18) and 1 or 2
-        local gapY = (ctx.h < 18) and 0 or 1
-        local startY = 5
-        local padKeys = {{"1","2","3"},{"4","5","6"},{"7","8","9"},{"DEL","0","OK"}}
-
-        for r, row in ipairs(padKeys) do
-            for c, keyText in ipairs(row) do
-                local x = 2 + (c - 1) * (btnW + 1)
-                local y = startY + (r - 1) * (bH + gapY)
-                local bg = (ctx.isColor and colors.cyan or colors.white)
-                if keyText == "DEL" then bg = (ctx.isColor and colors.orange or colors.white)
-                elseif keyText == "OK" then bg = (ctx.isColor and colors.green or colors.white) end
-
-                addButton(ctx, "k"..keyText, keyText, x, y, btnW, bH, bg, colors.black, function() return keyText end)
-            end
-        end
-
-        if allowCancel then
-            local cancelY = startY + 4 * (bH + gapY)
-            if cancelY < ctx.h then
-                addButton(ctx, "cancel", "Annuler", 2, cancelY, ctx.w - 3, 1, (ctx.isColor and colors.red or colors.white), colors.white, function() return "CANCEL" end)
-            end
-        end
-
-        drawButtons(ctx)
-
         local evType, p1, p2 = pullCtxEvent(ctx)
         local pressedKey = nil
-
-        if evType == "touch" then
-            local cb = handleTouch(ctx, p1, p2)
-            if cb then pressedKey = cb() end
-        elseif evType == "char" and string.match(p1, "[0-9]") then
-            pressedKey = p1
+        if evType == "tick" then drawHeader(ctx, title)
+        elseif evType == "touch" then local cb = handleTouch(ctx, p1, p2); if cb then pressedKey = cb() end
+        elseif evType == "char" and string.match(p1, "[a-zA-Z0-9%-_ ]") then pressedKey = string.upper(p1)
         elseif evType == "key" then
-            if p1 == keys.backspace then pressedKey = "DEL"
-            elseif p1 == keys.enter or p1 == keys.numPadEnter then pressedKey = "OK" end
+            if p1 == keys.backspace then pressedKey = "DEL" elseif p1 == keys.enter then pressedKey = "OK" end
         end
 
         if pressedKey then
-            if pressedKey == "DEL" then value = string.sub(value, 1, math.max(0, #value - 1)); errorMsg = ""
-            elseif pressedKey == "OK" then
-                if #value > 0 then return value else errorMsg = "Saisissez un chiffre!" end
+            if pressedKey == "DEL" then value = string.sub(value, 1, math.max(0, #value - 1)); errorMsg = ""; drawField()
+            elseif pressedKey == "OK" then if #value > 0 then return value else errorMsg = "Entrez un nom!"; drawField() end
             elseif pressedKey == "CANCEL" then return nil
-            elseif #value < maxLen then value = value .. pressedKey; errorMsg = "" end
+            elseif #value < 12 then value = value .. pressedKey; errorMsg = ""; drawField() end
         end
     end
 end
 
 -- ====================================================
--- 4. LOGIQUE DE TERMINAL (BOUCLE PAR ECRAN)
+-- 4. PAVE NUMERIQUE (PIN ET MONTANTS)
+-- ====================================================
+local function getNumpadInput(ctx, title, isMasked, allowCancel)
+    local value, errorMsg = "", ""
+    clr(ctx); clearButtons(ctx)
+
+    local btnW = math.floor((ctx.w - 4) / 3)
+    local bH, gapY, startY = (ctx.h < 18) and 1 or 2, (ctx.h < 18) and 0 or 1, 5
+    local padKeys = {{"1","2","3"},{"4","5","6"},{"7","8","9"},{"DEL","0","OK"}}
+
+    for r, row in ipairs(padKeys) do
+        for c, keyText in ipairs(row) do
+            local bg = (ctx.isColor and colors.cyan or colors.white)
+            if keyText == "DEL" then bg = (ctx.isColor and colors.orange or colors.white)
+            elseif keyText == "OK" then bg = (ctx.isColor and colors.green or colors.white) end
+            addButton(ctx, "k"..keyText, keyText, 2 + (c - 1) * (btnW + 1), startY + (r - 1) * (bH + gapY), btnW, bH, bg, colors.black, function() return keyText end)
+        end
+    end
+    if allowCancel then
+        local cancelY = startY + 4 * (bH + gapY)
+        if cancelY < ctx.h then addButton(ctx, "cancel", "Annuler", 2, cancelY, ctx.w - 3, 1, (ctx.isColor and colors.red or colors.white), colors.white, function() return "CANCEL" end) end
+    end
+
+    drawButtons(ctx); drawFooter(ctx, "Saisir Montant/PIN")
+
+    local function drawField()
+        ctx.t.setCursorPos(2, 3); ctx.t.setBackgroundColor(colors.black); ctx.t.setTextColor(colors.yellow)
+        local dVal = isMasked and string.rep("*", #value) or value
+        ctx.t.write(string.sub(" " .. dVal .. string.rep(" ", math.max(0, ctx.w - 2 - #dVal - 1)), 1, ctx.w - 2))
+        ctx.t.setCursorPos(2, 4)
+        if errorMsg ~= "" then
+            ctx.t.setTextColor(ctx.isColor and colors.red or colors.white); ctx.t.setBackgroundColor(ctx.isColor and colors.gray or colors.black)
+            ctx.t.write(string.sub(errorMsg .. string.rep(" ", ctx.w), 1, ctx.w - 2))
+        else
+            ctx.t.setBackgroundColor(ctx.isColor and colors.gray or colors.black); ctx.t.write(string.rep(" ", ctx.w - 2))
+        end
+    end
+
+    drawHeader(ctx, title); drawField()
+
+    while true do
+        local evType, p1, p2 = pullCtxEvent(ctx)
+        local pressedKey = nil
+        if evType == "tick" then drawHeader(ctx, title)
+        elseif evType == "touch" then local cb = handleTouch(ctx, p1, p2); if cb then pressedKey = cb() end
+        elseif evType == "char" and string.match(p1, "[0-9]") then pressedKey = p1
+        elseif evType == "key" then
+            if p1 == keys.backspace then pressedKey = "DEL" elseif p1 == keys.enter or p1 == keys.numPadEnter then pressedKey = "OK" end
+        end
+
+        if pressedKey then
+            if pressedKey == "DEL" then value = string.sub(value, 1, math.max(0, #value - 1)); errorMsg = ""; drawField()
+            elseif pressedKey == "OK" then if #value > 0 then return value else errorMsg = "Valeur vide!"; drawField() end
+            elseif pressedKey == "CANCEL" then return nil
+            elseif #value < 8 then value = value .. pressedKey; errorMsg = ""; drawField() end
+        end
+    end
+end
+
+-- ====================================================
+-- 5. LOGIQUE DE TERMINAL INDIVIDUEL
 -- ====================================================
 local function runAtmTerminal(target_term, target_name)
     local ctx = createContext(target_term, target_name)
 
     while true do
-        local currentAccountId = nil
+        local currentAccountName = nil
         
-        -- ECRAN DE CONNEXION
-        while not currentAccountId do
-            local idInput = getNumpadInput(ctx, "ID Compte", false, false)
-            if bankData.accounts[idInput] then
+        while not currentAccountName do
+            local nameInput = getAzertyInput(ctx, "ID Compte", false)
+            local realAccountName = getAccountByName(nameInput)
+
+            if realAccountName then
                 local pinInput = getNumpadInput(ctx, "Code PIN", true, true)
-                if pinInput == bankData.accounts[idInput].pin then
-                    currentAccountId = idInput
+                if pinInput == bankData.accounts[realAccountName].pin then
+                    currentAccountName = realAccountName
                 else
-                    clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Code PIN Incorrect")
-                    sleep(1.5)
+                    clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Code PIN Incorrect"); sleep(1.5)
                 end
-            else
-                clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Compte Inconnu")
-                sleep(1.5)
+            elseif nameInput then
+                clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Compte Inconnu"); sleep(1.5)
             end
         end
 
-        -- DASHBOARD PRINCIPAL
-        local running = true
-        while running do
-            local acc = bankData.accounts[currentAccountId]
-            clr(ctx); clearButtons(ctx)
-            drawHeader(ctx, acc.name)
-            drawFooter(ctx, "Que voulez-vous faire ?")
+        local function runDashboard()
+            while true do
+                local acc = bankData.accounts[currentAccountName]
+                clr(ctx); clearButtons(ctx)
+                
+                local btnW = ctx.w - 3
+                addButton(ctx, "dep", "+ Depot", 2, 6, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "depot" end)
+                addButton(ctx, "ret", "- Retrait", 2, 9, btnW, 2, (ctx.isColor and colors.orange or colors.white), colors.black, function() return "retrait" end)
+                addButton(ctx, "quit", "Deconnexion", 2, 13, btnW, 1, (ctx.isColor and colors.red or colors.white), colors.white, function() return "logout" end)
+                
+                drawButtons(ctx); drawFooter(ctx, "Action ?")
 
-            ctx.t.setBackgroundColor(colors.black)
-            for y = 3, 4 do ctx.t.setCursorPos(2, y); ctx.t.write(string.rep(" ", ctx.w - 2)) end
-            ctx.t.setCursorPos(3, 3); ctx.t.setTextColor(colors.lightGray); ctx.t.write("Solde :")
-            ctx.t.setCursorPos(3, 4); ctx.t.setTextColor(colors.green); ctx.t.write("$" .. string.format("%.2f", acc.balance))
+                ctx.t.setBackgroundColor(colors.black)
+                for y = 3, 4 do ctx.t.setCursorPos(2, y); ctx.t.write(string.rep(" ", ctx.w - 2)) end
+                ctx.t.setCursorPos(3, 3); ctx.t.setTextColor(colors.lightGray); ctx.t.write("Solde :")
+                ctx.t.setCursorPos(3, 4); ctx.t.setTextColor(colors.green); ctx.t.write("$" .. string.format("%.2f", acc.balance))
 
-            local btnW = ctx.w - 3
-            addButton(ctx, "dep", "+ Depot", 2, 6, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function()
-                local val = getNumpadInput(ctx, "Montant Depot", false, true)
-                local amt = tonumber(val)
-                if amt and amt > 0 then
-                    bankData.accounts[currentAccountId].balance = acc.balance + amt
-                    logTransaction(acc.name, "+$"..amt.." (Depot)")
-                end
-            end)
-
-            addButton(ctx, "ret", "- Retrait", 2, 9, btnW, 2, (ctx.isColor and colors.orange or colors.white), colors.black, function()
-                local val = getNumpadInput(ctx, "Montant Retrait", false, true)
-                local amt = tonumber(val)
-                if amt and amt > 0 then
-                    if acc.balance >= amt then
-                        bankData.accounts[currentAccountId].balance = acc.balance - amt
-                        logTransaction(acc.name, "-$"..amt.." (Retrait)")
-                    else
-                        clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Fonds insuffisants"); sleep(1.5)
+                while true do
+                    drawHeader(ctx, acc.name or currentAccountName)
+                    local evType, p1, p2 = pullCtxEvent(ctx)
+                    if evType == "tick" then
+                        drawHeader(ctx, acc.name or currentAccountName)
+                    elseif evType == "touch" then
+                        local cb = handleTouch(ctx, p1, p2)
+                        if cb then
+                            local action = cb()
+                            if action == "logout" then return end
+                            if action == "depot" then
+                                local val = getNumpadInput(ctx, "Montant Depot", false, true)
+                                local amt = tonumber(val)
+                                if amt and amt > 0 then
+                                    bankData.accounts[currentAccountName].balance = acc.balance + amt
+                                    logTransaction(currentAccountName, "+$"..amt.." (Depot)")
+                                end
+                                break -- Casse la boucle interne pour redessiner le dashboard
+                            elseif action == "retrait" then
+                                local val = getNumpadInput(ctx, "Montant Retrait", false, true)
+                                local amt = tonumber(val)
+                                if amt and amt > 0 then
+                                    if acc.balance >= amt then
+                                        bankData.accounts[currentAccountName].balance = acc.balance - amt
+                                        logTransaction(currentAccountName, "-$"..amt.." (Retrait)")
+                                    else
+                                        clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Fonds insuffisants"); sleep(1.5)
+                                    end
+                                end
+                                break
+                            end
+                        end
                     end
                 end
-            end)
-
-            addButton(ctx, "quit", "Deconnexion", 2, 13, btnW, 1, (ctx.isColor and colors.red or colors.white), colors.white, function()
-                return "logout"
-            end)
-
-            drawButtons(ctx)
-
-            local evType, p1, p2 = pullCtxEvent(ctx)
-            if evType == "touch" then
-                local cb = handleTouch(ctx, p1, p2)
-                if cb and cb() == "logout" then running = false end
             end
         end
+        
+        runDashboard()
     end
 end
 
 -- ====================================================
--- 5. ECRAN DE LOG SERVEUR (ORDINATEUR CENTRAL)
+-- 6. ECRAN DE LOG SERVEUR (ORDINATEUR CENTRAL)
 -- ====================================================
 local function runServerLog()
-    local oldTerm = term.redirect(term.native())
+    term.redirect(term.native())
     local w, h = term.getSize()
     
     local function drawLogs()
-        term.setBackgroundColor(colors.black)
-        term.clear()
-        term.setCursorPos(1,1)
-        term.setBackgroundColor(colors.blue)
-        term.setTextColor(colors.white)
-        term.clearLine()
+        term.setBackgroundColor(colors.black); term.clear()
+        term.setCursorPos(1,1); term.setBackgroundColor(colors.blue); term.setTextColor(colors.white); term.clearLine()
         term.write(" LOGS SERVEUR BANCAIRE - EN DIRECT")
         
         term.setBackgroundColor(colors.black)
@@ -338,13 +388,18 @@ loadData()
 local monitors = {peripheral.find("monitor")}
 local tasks = {}
 
+-- Generateur d'evenements d'horloge (met a jour les ecrans sans bloquer)
+table.insert(tasks, function()
+    while true do
+        sleep(1)
+        os.queueEvent("bank_tick")
+    end
+end)
+
 if #monitors == 0 then
-    -- Si 0 ecran externe : L'ordinateur principal devient le distributeur
     table.insert(tasks, function() runAtmTerminal(term.native(), "computer") end)
 else
-    -- Si 1 ou plusieurs ecrans : Ordi = Logs, Ecrans = Distributeurs
     table.insert(tasks, runServerLog)
-    
     local names = peripheral.getNames()
     for _, name in ipairs(names) do
         if peripheral.getType(name) == "monitor" then
@@ -355,5 +410,4 @@ else
     end
 end
 
--- Lancement de tous les ecrans en meme temps (Multitâche)
 parallel.waitForAll(table.unpack(tasks))
