@@ -1,5 +1,5 @@
 -- ====================================================
--- CraftBank OS - Multi-Ecrans & Inscription Intégrée
+-- BankOS - Multi-Ecrans & Inscription Intégrée
 -- ====================================================
 
 -- ====================================================
@@ -148,8 +148,8 @@ local function getAzertyInput(ctx, title, allowCancel)
     }
     clr(ctx); clearButtons(ctx)
 
-    local bH = 1
-    local gapY = (ctx.h < 16) and 0 or 1
+    local bH = 2
+    local gapY = (ctx.h < 16) and 0 or 2
     local startY = 5
 
     for r, row in ipairs(kb) do
