@@ -9,7 +9,7 @@ local dataFile = "bank_data.txt"
 local bankData = {
     accounts = {
         ["Twilight"] = { pin = "1234", balance = 1500 },
-        ["Admin"] = { pin = "0000", balance = 9999 }
+        ["AdminBan"] = { pin = "0000", balance = 99999999 }
     },
     globalHistory = {}
 }
