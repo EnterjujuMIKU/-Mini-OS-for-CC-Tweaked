@@ -1,6 +1,11 @@
 -- ====================================================
--- BankOS - Système Bancaire Sécurisé & Multi-Terminaux
+-- CONFIGURATION DES TERMINAUX (ÉCRANS & LECTEURS)
+-- Modifie facilement tes paires écran/drive ici !
 -- ====================================================
+local TERMINALS_CONFIG = {
+    { monitor = "monitor_17", drive = "drive_3" }, -- Écran Gauche
+    { monitor = "monitor_16", drive = "drive_4" }, -- Écran Droit
+}
 
 local MASTER_KEY = "CraftBank_Secret_Key_2026"
 local dataFile = "bank_data.txt"
@@ -446,7 +451,6 @@ local function runAtmTerminal(target_term, target_name, drive_name)
             if rawCardId and rawCardId ~= "UNLINKED" then
                 local cardAcc = getAccountByCard(rawCardId)
                 if cardAcc then
-                    -- AUTO-CONNEXION ET MISE A JOUR AUTOMATIQUE PAR CARTE
                     currentAccountName = cardAcc
                     break
                 else
@@ -467,7 +471,6 @@ local function runAtmTerminal(target_term, target_name, drive_name)
                 if evType == "tick" then 
                     drawHeader(ctx, "BankOS")
                 elseif evType == "disk_change" then
-                    -- Re-détecte immédiatement l'insertion de carte
                     break
                 elseif evType == "touch" then
                     local cb = handleTouch(ctx, p1, p2)
@@ -512,12 +515,11 @@ local function runAtmTerminal(target_term, target_name, drive_name)
 
         local function runDashboard()
             while true do
-                -- Vérifie si la carte insérée correspond toujours ou si elle a été retirée
                 local rawCardId = getInsertedCardId(ctx.drive)
                 if rawCardId and rawCardId ~= "UNLINKED" then
                     local cardAcc = getAccountByCard(rawCardId)
                     if cardAcc and cardAcc ~= currentAccountName then
-                        currentAccountName = cardAcc -- Mise à jour vers la nouvelle carte insérée
+                        currentAccountName = cardAcc
                     end
                 end
 
@@ -526,10 +528,9 @@ local function runAtmTerminal(target_term, target_name, drive_name)
                 
                 local btnW = ctx.w - 3
                 
-                -- NOUVEAU BOUTON : Modifier PIN (placé tout en haut juste au-dessus du Solde)
+                -- BOUTON : Modifier PIN au-dessus du solde
                 addButton(ctx, "chpin", "Modifier PIN", 2, 2, btnW, 1, (ctx.isColor and colors.purple or colors.white), colors.white, function() return "change_pin" end)
                 
-                -- Boutons standards de transaction
                 addButton(ctx, "dep", "+ Depot", 2, 7, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "depot" end)
                 addButton(ctx, "ret", "- Retrait", 2, 10, btnW, 2, (ctx.isColor and colors.orange or colors.white), colors.black, function() return "retrait" end)
                 addButton(ctx, "tra", "-> Transfert", 2, 13, btnW, 2, (ctx.isColor and colors.purple or colors.white), colors.white, function() return "transfert" end)
@@ -539,7 +540,7 @@ local function runAtmTerminal(target_term, target_name, drive_name)
                 
                 drawButtons(ctx); drawFooter(ctx, "Bienvenue " .. currentAccountName)
 
-                -- AFFICHAGE DU SOLDE (Juste en-dessous du bouton Modifier PIN)
+                -- AFFICHAGE DU SOLDE
                 ctx.t.setBackgroundColor(colors.black)
                 for y = 4, 5 do ctx.t.setCursorPos(2, y); ctx.t.write(string.rep(" ", ctx.w - 2)) end
                 ctx.t.setCursorPos(3, 4); ctx.t.setTextColor(colors.lightGray); ctx.t.write("Solde :")
@@ -550,7 +551,7 @@ local function runAtmTerminal(target_term, target_name, drive_name)
                     local evType, p1, p2 = pullCtxEvent(ctx)
                     
                     if evType == "tick" or evType == "disk_change" then
-                        break -- Rafraîchit automatiquement le dashboard si la disquette ou le solde change
+                        break
                     elseif evType == "touch" then
                         local cb = handleTouch(ctx, p1, p2)
                         if cb then
@@ -742,12 +743,13 @@ local function runServerLogAndAPI()
 end
 
 -- ====================================================
--- LANCEMENT DU SYSTEME AVEC DELECTON DE LECTEUR
+-- LANCEMENT DU SYSTEME AVEC CONFIGURATION
 -- ====================================================
 loadData()
 
 local tasks = {}
 
+-- Horloge système pour rafraîchir l'heure
 table.insert(tasks, function()
     while true do
         sleep(1)
@@ -755,20 +757,19 @@ table.insert(tasks, function()
     end
 end)
 
-local monitors = {peripheral.find("monitor")}
-if #monitors == 0 then
-    table.insert(tasks, function() runAtmTerminal(term.native(), "computer", nil) end)
-else
-    table.insert(tasks, runServerLogAndAPI)
-    
-    -- Association dynamique : Gauche -> drive_3, Droite -> drive_4
-    for idx, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "monitor" then
-            local m = peripheral.wrap(name)
-            m.setTextScale(0.5)
-            local assignedDrive = (idx == 1 and "drive_3") or (idx == 2 and "drive_4") or nil
-            table.insert(tasks, function() runAtmTerminal(m, name, assignedDrive) end)
-        end
+-- Affichage du terminal Serveur/Logs sur l'ordinateur principal
+table.insert(tasks, runServerLogAndAPI)
+
+-- Lancement des terminaux selon la table TERMINALS_CONFIG du haut
+for _, cfg in ipairs(TERMINALS_CONFIG) do
+    if peripheral.isPresent(cfg.monitor) then
+        local m = peripheral.wrap(cfg.monitor)
+        m.setTextScale(0.5)
+        local monName = cfg.monitor
+        local drvName = cfg.drive
+        table.insert(tasks, function() runAtmTerminal(m, monName, drvName) end)
+    else
+        print("Attention : Moniteur introuvable : " .. cfg.monitor)
     end
 end
 
