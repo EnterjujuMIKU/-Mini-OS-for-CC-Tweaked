@@ -1,25 +1,109 @@
 -- ====================================================
--- BankOS - Multi-Ecrans & Inscription Intégrée
+-- BankOS - Système Bancaire Sécurisé & Multi-Terminaux
 -- ====================================================
 
--- ====================================================
--- 1. BASE DE DONNEES (Par Nom de Compte)
--- ====================================================
+local MASTER_KEY = "CraftBank_Secret_Key_2026"
 local dataFile = "bank_data.txt"
+local historyFile = "globalHistory.txt"
+
+-- ====================================================
+-- 1. MODULE DE CHIFFREMENT & HACHAGE
+-- ====================================================
+local function cipher(text, key)
+    local result = {}
+    local keyLen = #key
+    for i = 1, #text do
+        local charCode = string.byte(text, i)
+        local keyByte = string.byte(key, ((i - 1) % keyLen) + 1)
+        local encryptedByte = bit.bxor(charCode, keyByte + (i % 256)) % 256
+        table.insert(result, string.char(encryptedByte))
+    end
+    return table.concat(result)
+end
+
+local function generateCardCode()
+    local charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    local code = ""
+    for i = 1, 24 do
+        local rand = math.random(1, #charset)
+        code = code .. string.sub(charset, rand, rand)
+        if i % 4 == 0 and i < 24 then code = code .. "-" end
+    end
+    return code
+end
+
+local function hashCardCode(rawCode)
+    local salt = "CraftBank2026"
+    local combined = rawCode .. salt
+    local charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    
+    local hashBytes = {}
+    for i = 1, 24 do hashBytes[i] = string.byte(salt, (i % #salt) + 1) end
+    
+    for i = 1, #combined do
+        local charByte = string.byte(combined, i)
+        local pos = ((i - 1) % 24) + 1
+        hashBytes[pos] = bit.bxor(hashBytes[pos], charByte * 31 + i) % 256
+    end
+    
+    local finalHash = ""
+    for i = 1, 24 do
+        local index = (hashBytes[i] % #charset) + 1
+        finalHash = finalHash .. string.sub(charset, index, index)
+        if i % 4 == 0 and i < 24 then finalHash = finalHash .. "-" end
+    end
+    
+    return finalHash
+end
+
+-- ====================================================
+-- 2. BASE DE DONNEES & FICHIERS
+-- ====================================================
 local bankData = {
     accounts = {
-        ["Twilight"] = { pin = "1234", balance = 1500 },
-        ["AdminBan"] = { pin = "0000", balance = 99999999 }
-    },
-    globalHistory = {}
+        ["Twilight"] = { pin = "1234", balance = 1500, cardHash = nil, history = {} },
+        ["Admin"] = { pin = "0000", balance = 9999, cardHash = nil, history = {} }
+    }
 }
 
-local function saveData()
-    local f = fs.open(dataFile, "w")
+local globalHistory = {}
+
+local function saveGlobalHistory()
+    local serialized = textutils.serialize(globalHistory)
+    local encrypted = cipher(serialized, MASTER_KEY)
+    local f = fs.open(historyFile, "w")
     if f then
-        f.write(textutils.serialize(bankData))
+        f.write(encrypted)
         f.close()
     end
+end
+
+local function loadGlobalHistory()
+    if fs.exists(historyFile) then
+        local f = fs.open(historyFile, "r")
+        if f then
+            local encrypted = f.readAll()
+            f.close()
+            local decrypted = cipher(encrypted, MASTER_KEY)
+            local parsed = textutils.unserialize(decrypted)
+            if parsed and type(parsed) == "table" then
+                globalHistory = parsed
+            end
+        end
+    else
+        saveGlobalHistory()
+    end
+end
+
+local function saveData()
+    local serialized = textutils.serialize(bankData)
+    local encrypted = cipher(serialized, MASTER_KEY)
+    local f = fs.open(dataFile, "w")
+    if f then
+        f.write(encrypted)
+        f.close()
+    end
+    saveGlobalHistory()
     os.queueEvent("bank_update")
 end
 
@@ -27,33 +111,103 @@ local function loadData()
     if fs.exists(dataFile) then
         local f = fs.open(dataFile, "r")
         if f then
-            local parsed = textutils.unserialize(f.readAll())
+            local encrypted = f.readAll()
             f.close()
-            if parsed and parsed.accounts then bankData = parsed end
+            local decrypted = cipher(encrypted, MASTER_KEY)
+            local parsed = textutils.unserialize(decrypted)
+            if parsed and parsed.accounts then 
+                bankData = parsed 
+                for k, v in pairs(bankData.accounts) do
+                    if not v.history then v.history = {} end
+                end
+            end
         end
     else
         saveData()
     end
+    loadGlobalHistory()
 end
 
 local function getAccountByName(name)
     for k, v in pairs(bankData.accounts) do
         if string.lower(k) == string.lower(name) then
-            return k -- Retourne le vrai nom avec la bonne casse
+            return k
+        end
+    end
+    return nil
+end
+
+local function getAccountByCard(rawCardId)
+    if not rawCardId or rawCardId == "UNLINKED" then return nil end
+    local computedHash = hashCardCode(rawCardId)
+    for k, v in pairs(bankData.accounts) do
+        if v.cardHash == computedHash then
+            return k
         end
     end
     return nil
 end
 
 local function logTransaction(accountName, actionText)
-    local entry = string.format("[%s] %s: %s", textutils.formatTime(os.time(), true), accountName, actionText)
-    table.insert(bankData.globalHistory, entry)
-    if #bankData.globalHistory > 50 then table.remove(bankData.globalHistory, 1) end
+    local timestamp = textutils.formatTime(os.time(), true)
+    local entry = string.format("[%s] %s", timestamp, actionText)
+    
+    table.insert(globalHistory, string.format("[%s] %s: %s", timestamp, accountName, actionText))
+    if #globalHistory > 50 then table.remove(globalHistory, 1) end
+    
+    if bankData.accounts[accountName] then
+        if not bankData.accounts[accountName].history then bankData.accounts[accountName].history = {} end
+        table.insert(bankData.accounts[accountName].history, entry)
+        if #bankData.accounts[accountName].history > 10 then 
+            table.remove(bankData.accounts[accountName].history, 1) 
+        end
+    end
+    
     saveData()
 end
 
 -- ====================================================
--- 2. MOTEUR D'INTERFACE ISOLE
+-- 3. GESTION DES CARTES BANCAIRES
+-- ====================================================
+local function getInsertedCardId()
+    for _, s in ipairs({"top","bottom","left","right","front","back"}) do
+        if disk.isPresent(s) and disk.hasData(s) then
+            local mountPath = disk.getMountPath(s)
+            if mountPath then
+                local cardFile = fs.combine(mountPath, ".bank_card")
+                if fs.exists(cardFile) then
+                    local f = fs.open(cardFile, "r")
+                    if f then
+                        local rawCardId = cipher(f.readAll(), MASTER_KEY)
+                        f.close()
+                        return rawCardId, s
+                    end
+                else
+                    return "UNLINKED", s
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function writeCardId(side, rawCardId)
+    local mountPath = disk.getMountPath(side)
+    if mountPath then
+        local cardFile = fs.combine(mountPath, ".bank_card")
+        local f = fs.open(cardFile, "w")
+        if f then
+            f.write(cipher(rawCardId, MASTER_KEY))
+            f.close()
+            disk.setLabel(side, "Carte Bancaire")
+            return true
+        end
+    end
+    return false
+end
+
+-- ====================================================
+-- 4. MOTEUR D'INTERFACE ISOLE
 -- ====================================================
 local function createContext(target_term, target_name)
     local ctx = { t = target_term, name = target_name, buttons = {}, isColor = target_term.isColor() }
@@ -137,7 +291,7 @@ local function drawFooter(ctx, info)
 end
 
 -- ====================================================
--- 3. CLAVIER AZERTY (LETTRES POUR NOM)
+-- 5. CLAVIERS ET SAISIES
 -- ====================================================
 local function getAzertyInput(ctx, title, allowCancel)
     local value, errorMsg = "", ""
@@ -148,8 +302,8 @@ local function getAzertyInput(ctx, title, allowCancel)
     }
     clr(ctx); clearButtons(ctx)
 
-    local bH = 2
-    local gapY = (ctx.h < 16) and 0 or 2
+    local bH = 1
+    local gapY = (ctx.h < 16) and 0 or 1
     local startY = 5
 
     for r, row in ipairs(kb) do
@@ -204,9 +358,6 @@ local function getAzertyInput(ctx, title, allowCancel)
     end
 end
 
--- ====================================================
--- 4. PAVE NUMERIQUE (PIN ET MONTANTS)
--- ====================================================
 local function getNumpadInput(ctx, title, isMasked, allowCancel)
     local value, errorMsg = "", ""
     clr(ctx); clearButtons(ctx)
@@ -228,7 +379,7 @@ local function getNumpadInput(ctx, title, isMasked, allowCancel)
         if cancelY < ctx.h then addButton(ctx, "cancel", "Annuler", 2, cancelY, ctx.w - 3, 1, (ctx.isColor and colors.red or colors.white), colors.white, function() return "CANCEL" end) end
     end
 
-    drawButtons(ctx); drawFooter(ctx, "Saisir Montant/PIN")
+    drawButtons(ctx); drawFooter(ctx, "Saisir Code / Montant")
 
     local function drawField()
         ctx.t.setCursorPos(2, 3); ctx.t.setBackgroundColor(colors.black); ctx.t.setTextColor(colors.yellow)
@@ -265,7 +416,7 @@ local function getNumpadInput(ctx, title, isMasked, allowCancel)
 end
 
 -- ====================================================
--- 5. LOGIQUE DE TERMINAL INDIVIDUEL
+-- 6. TERMINAL PRINCIPAL
 -- ====================================================
 local function runAtmTerminal(target_term, target_name)
     local ctx = createContext(target_term, target_name)
@@ -274,31 +425,51 @@ local function runAtmTerminal(target_term, target_name)
         local currentAccountName = nil
         
         while not currentAccountName do
-            -- ECRAN D'ACCUEIL : CONNEXION OU INSCRIPTION
             clr(ctx); clearButtons(ctx)
-            drawHeader(ctx, "CraftBank")
-            drawFooter(ctx, "Choisissez une action")
-
-            local btnW = ctx.w - 2
-            local midY = math.floor(ctx.h / 2)
+            drawHeader(ctx, "BankOS")
             
-            addButton(ctx, "btn_log", "Se Connecter", 2, midY - 2, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "login" end)
-            addButton(ctx, "btn_reg", "S'inscrire", 2, midY + 1, btnW, 2, (ctx.isColor and colors.cyan or colors.white), colors.black, function() return "register" end)
+            local rawCardId, cardSide = getInsertedCardId()
+            local btnW = ctx.w - 2
+            
+            if rawCardId and rawCardId ~= "UNLINKED" then
+                local cardAcc = getAccountByCard(rawCardId)
+                drawFooter(ctx, "Carte Detectee !")
+                ctx.t.setCursorPos(2, 3); ctx.t.setTextColor(colors.yellow); ctx.t.write("Carte de : " .. (cardAcc or "Inconnue"))
+                
+                addButton(ctx, "btn_card_login", "Inserer PIN Carte", 2, 6, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "card_login" end)
+                addButton(ctx, "btn_other", "Autre Connexion", 2, 9, btnW, 2, (ctx.isColor and colors.gray or colors.white), colors.black, function() return "other" end)
+            else
+                drawFooter(ctx, "Inserez carte ou choisissez")
+                addButton(ctx, "btn_log", "Se Connecter", 2, 5, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "login" end)
+                addButton(ctx, "btn_reg", "S'inscrire", 2, 8, btnW, 2, (ctx.isColor and colors.cyan or colors.white), colors.black, function() return "register" end)
+            end
             
             drawButtons(ctx)
             
             local action = nil
             while not action do
                 local evType, p1, p2 = pullCtxEvent(ctx)
-                if evType == "tick" then drawHeader(ctx, "CraftBank")
+                if evType == "tick" then drawHeader(ctx, "BankOS")
                 elseif evType == "touch" then
                     local cb = handleTouch(ctx, p1, p2)
                     if cb then action = cb() end
                 end
             end
 
-            -- LOGIQUE DE CONNEXION
-            if action == "login" then
+            if action == "card_login" then
+                local cardAcc = getAccountByCard(rawCardId)
+                if cardAcc then
+                    local pinInput = getNumpadInput(ctx, "Code PIN Carte", true, true)
+                    if pinInput == bankData.accounts[cardAcc].pin then
+                        currentAccountName = cardAcc
+                    elseif pinInput then
+                        clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("PIN Incorrect"); sleep(1.5)
+                    end
+                else
+                    clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Carte non reconnue"); sleep(1.5)
+                end
+
+            elseif action == "login" or action == "other" then
                 local nameInput = getAzertyInput(ctx, "ID Compte", true)
                 if nameInput then
                     local realAccountName = getAccountByName(nameInput)
@@ -307,14 +478,13 @@ local function runAtmTerminal(target_term, target_name)
                         if pinInput == bankData.accounts[realAccountName].pin then
                             currentAccountName = realAccountName
                         elseif pinInput then
-                            clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Code PIN Incorrect"); sleep(1.5)
+                            clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("PIN Incorrect"); sleep(1.5)
                         end
                     else
                         clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Compte Inconnu"); sleep(1.5)
                     end
                 end
                 
-            -- LOGIQUE D'INSCRIPTION
             elseif action == "register" then
                 local nameInput = getAzertyInput(ctx, "Nouveau Nom", true)
                 if nameInput then
@@ -323,13 +493,11 @@ local function runAtmTerminal(target_term, target_name)
                     else
                         local pinInput = getNumpadInput(ctx, "Nouveau PIN", true, true)
                         if pinInput then
-                            -- Création et sauvegarde du compte
-                            bankData.accounts[nameInput] = { pin = pinInput, balance = 0 }
+                            bankData.accounts[nameInput] = { pin = pinInput, balance = 0, cardHash = nil, history = {} }
                             saveData()
                             logTransaction("SYSTEME", "Creation compte: " .. nameInput)
-                            
                             clr(ctx); drawHeader(ctx, "Succes"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.lime); ctx.t.write("Compte cree !"); sleep(1.5)
-                            currentAccountName = nameInput -- Connecte le joueur directement
+                            currentAccountName = nameInput
                         end
                     end
                 end
@@ -344,9 +512,12 @@ local function runAtmTerminal(target_term, target_name)
                 local btnW = ctx.w - 3
                 addButton(ctx, "dep", "+ Depot", 2, 6, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "depot" end)
                 addButton(ctx, "ret", "- Retrait", 2, 9, btnW, 2, (ctx.isColor and colors.orange or colors.white), colors.black, function() return "retrait" end)
-                addButton(ctx, "quit", "Deconnexion", 2, 13, btnW, 1, (ctx.isColor and colors.red or colors.white), colors.white, function() return "logout" end)
+                addButton(ctx, "tra", "-> Transfert", 2, 12, btnW, 2, (ctx.isColor and colors.purple or colors.white), colors.white, function() return "transfert" end)
+                addButton(ctx, "his", "Historique", 2, 15, btnW, 1, (ctx.isColor and colors.lightBlue or colors.white), colors.black, function() return "history" end)
+                addButton(ctx, "crd", "Lier Carte", 2, 17, btnW, 1, (ctx.isColor and colors.yellow or colors.white), colors.black, function() return "card" end)
+                addButton(ctx, "quit", "Deconnexion", 2, 19, btnW, 1, (ctx.isColor and colors.red or colors.white), colors.white, function() return "logout" end)
                 
-                drawButtons(ctx); drawFooter(ctx, "Action ?")
+                drawButtons(ctx); drawFooter(ctx, "Bienvenue " .. currentAccountName)
 
                 ctx.t.setBackgroundColor(colors.black)
                 for y = 3, 4 do ctx.t.setCursorPos(2, y); ctx.t.write(string.rep(" ", ctx.w - 2)) end
@@ -354,15 +525,16 @@ local function runAtmTerminal(target_term, target_name)
                 ctx.t.setCursorPos(3, 4); ctx.t.setTextColor(colors.green); ctx.t.write("$" .. string.format("%.2f", acc.balance))
 
                 while true do
-                    drawHeader(ctx, acc.name or currentAccountName)
+                    drawHeader(ctx, currentAccountName)
                     local evType, p1, p2 = pullCtxEvent(ctx)
                     if evType == "tick" then
-                        drawHeader(ctx, acc.name or currentAccountName)
+                        drawHeader(ctx, currentAccountName)
                     elseif evType == "touch" then
                         local cb = handleTouch(ctx, p1, p2)
                         if cb then
                             local a = cb()
                             if a == "logout" then return end
+                            
                             if a == "depot" then
                                 local val = getNumpadInput(ctx, "Montant Depot", false, true)
                                 local amt = tonumber(val)
@@ -371,6 +543,7 @@ local function runAtmTerminal(target_term, target_name)
                                     logTransaction(currentAccountName, "+$"..amt.." (Depot)")
                                 end
                                 break 
+                                
                             elseif a == "retrait" then
                                 local val = getNumpadInput(ctx, "Montant Retrait", false, true)
                                 local amt = tonumber(val)
@@ -381,6 +554,74 @@ local function runAtmTerminal(target_term, target_name)
                                     else
                                         clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Fonds insuffisants"); sleep(1.5)
                                     end
+                                end
+                                break
+
+                            elseif a == "transfert" then
+                                local targetInput = getAzertyInput(ctx, "Destinataire", true)
+                                if targetInput then
+                                    local realTarget = getAccountByName(targetInput)
+                                    if not realTarget then
+                                        clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Compte introuvable"); sleep(1.5)
+                                    elseif string.lower(realTarget) == string.lower(currentAccountName) then
+                                        clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Transfert impossible"); sleep(1.5)
+                                    else
+                                        local val = getNumpadInput(ctx, "Montant Virement", false, true)
+                                        local amt = tonumber(val)
+                                        if amt and amt > 0 then
+                                            if acc.balance >= amt then
+                                                bankData.accounts[currentAccountName].balance = acc.balance - amt
+                                                bankData.accounts[realTarget].balance = bankData.accounts[realTarget].balance + amt
+                                                logTransaction(currentAccountName, "-$"..amt.." -> " .. realTarget)
+                                                logTransaction(realTarget, "+$"..amt.." <- " .. currentAccountName)
+                                                clr(ctx); drawHeader(ctx, "Succes"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.lime); ctx.t.write("Virement effectue !"); sleep(1.5)
+                                            else
+                                                clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Fonds insuffisants"); sleep(1.5)
+                                            end
+                                        end
+                                    end
+                                end
+                                break
+
+                            elseif a == "history" then
+                                clr(ctx); clearButtons(ctx)
+                                drawHeader(ctx, "Mes Transactions")
+                                addButton(ctx, "back", "Retour", 2, ctx.h - 1, ctx.w - 3, 1, colors.gray, colors.white, function() return "back" end)
+                                drawButtons(ctx)
+                                
+                                local hList = bankData.accounts[currentAccountName].history or {}
+                                local yPos = 3
+                                for i = #hList, 1, -1 do
+                                    if yPos >= ctx.h - 2 then break end
+                                    ctx.t.setCursorPos(2, yPos)
+                                    local item = hList[i]
+                                    if string.find(item, "%+") then ctx.t.setTextColor(colors.lime)
+                                    elseif string.find(item, "%-") then ctx.t.setTextColor(colors.orange)
+                                    else ctx.t.setTextColor(colors.white) end
+                                    ctx.t.write(string.sub(item, 1, ctx.w - 2))
+                                    yPos = yPos + 1
+                                end
+                                
+                                while true do
+                                    local evType, p1, p2 = pullCtxEvent(ctx)
+                                    if evType == "touch" and handleTouch(ctx, p1, p2) then break end
+                                end
+                                break
+
+                            elseif a == "card" then
+                                local cId, side = getInsertedCardId()
+                                if side then
+                                    local rawCardId = generateCardCode()
+                                    local cardHash = hashCardCode(rawCardId)
+                                    if writeCardId(side, rawCardId) then
+                                        bankData.accounts[currentAccountName].cardHash = cardHash
+                                        saveData()
+                                        clr(ctx); drawHeader(ctx, "Succes"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.lime); ctx.t.write("Carte liee !"); sleep(1.5)
+                                    else
+                                        clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Erreur d'ecriture"); sleep(1.5)
+                                    end
+                                else
+                                    clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Inserez disquette"); sleep(1.5)
                                 end
                                 break
                             end
@@ -395,22 +636,25 @@ local function runAtmTerminal(target_term, target_name)
 end
 
 -- ====================================================
--- 6. ECRAN DE LOG SERVEUR (ORDINATEUR CENTRAL)
+-- 7. SERVEUR DE LOG ET API REDNET CRYPTEE
 -- ====================================================
-local function runServerLog()
+local function runServerLogAndAPI()
     term.redirect(term.native())
     local w, h = term.getSize()
     
+    local modem = peripheral.find("modem")
+    if modem then rednet.open(peripheral.getName(modem)) end
+
     local function drawLogs()
         term.setBackgroundColor(colors.black); term.clear()
         term.setCursorPos(1,1); term.setBackgroundColor(colors.blue); term.setTextColor(colors.white); term.clearLine()
-        term.write(" LOGS SERVEUR BANCAIRE - EN DIRECT")
+        term.write(" LOGS SERVEUR & API CRYPTEE")
         
         term.setBackgroundColor(colors.black)
         local startY = 3
-        for i = #bankData.globalHistory, math.max(1, #bankData.globalHistory - (h - 4)), -1 do
+        for i = #globalHistory, math.max(1, #globalHistory - (h - 4)), -1 do
             term.setCursorPos(2, startY)
-            local log = bankData.globalHistory[i]
+            local log = globalHistory[i]
             if string.find(log, "%+") then term.setTextColor(colors.lime)
             elseif string.find(log, "%-") then term.setTextColor(colors.red)
             else term.setTextColor(colors.lightGray) end
@@ -420,21 +664,58 @@ local function runServerLog()
     end
 
     drawLogs()
+
     while true do
-        local ev = os.pullEvent()
-        if ev == "bank_update" then drawLogs() end
+        local ev, p1, p2, p3 = os.pullEvent()
+        
+        if ev == "bank_update" then 
+            drawLogs()
+            
+        elseif ev == "rednet_message" then
+            local senderId, encryptedMsg = p1, p2
+            if type(encryptedMsg) == "string" then
+                local decryptedMsg = cipher(encryptedMsg, MASTER_KEY)
+                local req = textutils.unserialize(decryptedMsg)
+                
+                if req and req.type == "PAYMENT" then
+                    local accName = getAccountByName(req.account)
+                    local resp = { success = false, message = "Erreur" }
+                    
+                    if accName and bankData.accounts[accName].pin == req.pin then
+                        if bankData.accounts[accName].balance >= req.amount then
+                            bankData.accounts[accName].balance = bankData.accounts[accName].balance - req.amount
+                            if req.target then
+                                local targetAcc = getAccountByName(req.target)
+                                if targetAcc then
+                                    bankData.accounts[targetAcc].balance = bankData.accounts[targetAcc].balance + req.amount
+                                    logTransaction(targetAcc, "+$"..req.amount.." <- " .. accName)
+                                end
+                            end
+                            logTransaction(accName, "-$"..req.amount.." (Paiement API)")
+                            resp.success = true
+                            resp.message = "Paiement valide"
+                        else
+                            resp.message = "Fonds insuffisants"
+                        end
+                    else
+                        resp.message = "Identifiants invalides"
+                    end
+                    
+                    local replyEncrypted = cipher(textutils.serialize(resp), MASTER_KEY)
+                    rednet.send(senderId, replyEncrypted)
+                end
+            end
+        end
     end
 end
 
 -- ====================================================
--- LANCEMENT DU SYSTEME PARALLELE
+-- LANCEMENT DU SYSTEME
 -- ====================================================
 loadData()
 
-local monitors = {peripheral.find("monitor")}
 local tasks = {}
 
--- Horloge asynchrone pour mettre a jour les en-tetes (Daemon)
 table.insert(tasks, function()
     while true do
         sleep(1)
@@ -442,12 +723,12 @@ table.insert(tasks, function()
     end
 end)
 
+local monitors = {peripheral.find("monitor")}
 if #monitors == 0 then
     table.insert(tasks, function() runAtmTerminal(term.native(), "computer") end)
 else
-    table.insert(tasks, runServerLog)
-    local names = peripheral.getNames()
-    for _, name in ipairs(names) do
+    table.insert(tasks, runServerLogAndAPI)
+    for _, name in ipairs(peripheral.getNames()) do
         if peripheral.getType(name) == "monitor" then
             local m = peripheral.wrap(name)
             m.setTextScale(0.5)
