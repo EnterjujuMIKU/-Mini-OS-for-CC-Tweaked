@@ -167,23 +167,27 @@ local function logTransaction(accountName, actionText)
 end
 
 -- ====================================================
--- 3. GESTION DES CARTES BANCAIRES
+-- 3. GESTION DES CARTES BANCAIRES ET DRIVE SPECIFIQUE
 -- ====================================================
-local function getInsertedCardId()
-    for _, s in ipairs({"top","bottom","left","right","front","back"}) do
-        if disk.isPresent(s) and disk.hasData(s) then
-            local mountPath = disk.getMountPath(s)
-            if mountPath then
-                local cardFile = fs.combine(mountPath, ".bank_card")
-                if fs.exists(cardFile) then
-                    local f = fs.open(cardFile, "r")
-                    if f then
-                        local rawCardId = cipher(f.readAll(), MASTER_KEY)
-                        f.close()
-                        return rawCardId, s
+local function getInsertedCardId(assignedDrive)
+    local drives = assignedDrive and { assignedDrive } or { "drive_3", "drive_4", "top", "bottom", "left", "right", "front", "back" }
+    
+    for _, s in ipairs(drives) do
+        if peripheral.isPresent(s) or disk.isPresent(s) then
+            if disk.isPresent(s) and disk.hasData(s) then
+                local mountPath = disk.getMountPath(s)
+                if mountPath then
+                    local cardFile = fs.combine(mountPath, ".bank_card")
+                    if fs.exists(cardFile) then
+                        local f = fs.open(cardFile, "r")
+                        if f then
+                            local rawCardId = cipher(f.readAll(), MASTER_KEY)
+                            f.close()
+                            return rawCardId, s
+                        end
+                    else
+                        return "UNLINKED", s
                     end
-                else
-                    return "UNLINKED", s
                 end
             end
         end
@@ -207,10 +211,16 @@ local function writeCardId(side, rawCardId)
 end
 
 -- ====================================================
--- 4. MOTEUR D'INTERFACE ISOLE
+-- 4. MOTEUR D'INTERFACE
 -- ====================================================
-local function createContext(target_term, target_name)
-    local ctx = { t = target_term, name = target_name, buttons = {}, isColor = target_term.isColor() }
+local function createContext(target_term, target_name, drive_name)
+    local ctx = { 
+        t = target_term, 
+        name = target_name, 
+        drive = drive_name, 
+        buttons = {}, 
+        isColor = target_term.isColor() 
+    }
     ctx.w, ctx.h = ctx.t.getSize()
     return ctx
 end
@@ -254,6 +264,8 @@ local function pullCtxEvent(ctx)
         
         if type == "bank_tick" then
             return "tick"
+        elseif type == "disk" or type == "disk_eject" then
+            return "disk_change"
         elseif type == "mouse_click" and ctx.name == "computer" then
             return "touch", ev[3], ev[4]
         elseif type == "monitor_touch" and ctx.name == ev[2] then
@@ -418,8 +430,8 @@ end
 -- ====================================================
 -- 6. TERMINAL PRINCIPAL
 -- ====================================================
-local function runAtmTerminal(target_term, target_name)
-    local ctx = createContext(target_term, target_name)
+local function runAtmTerminal(target_term, target_name, drive_name)
+    local ctx = createContext(target_term, target_name, drive_name)
 
     while true do
         local currentAccountName = nil
@@ -428,16 +440,19 @@ local function runAtmTerminal(target_term, target_name)
             clr(ctx); clearButtons(ctx)
             drawHeader(ctx, "BankOS")
             
-            local rawCardId, cardSide = getInsertedCardId()
+            local rawCardId, cardSide = getInsertedCardId(ctx.drive)
             local btnW = ctx.w - 2
             
             if rawCardId and rawCardId ~= "UNLINKED" then
                 local cardAcc = getAccountByCard(rawCardId)
-                drawFooter(ctx, "Carte Detectee !")
-                ctx.t.setCursorPos(2, 3); ctx.t.setTextColor(colors.yellow); ctx.t.write("Carte de : " .. (cardAcc or "Inconnue"))
-                
-                addButton(ctx, "btn_card_login", "Inserer PIN Carte", 2, 6, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "card_login" end)
-                addButton(ctx, "btn_other", "Autre Connexion", 2, 9, btnW, 2, (ctx.isColor and colors.gray or colors.white), colors.black, function() return "other" end)
+                if cardAcc then
+                    -- AUTO-CONNEXION ET MISE A JOUR AUTOMATIQUE PAR CARTE
+                    currentAccountName = cardAcc
+                    break
+                else
+                    drawFooter(ctx, "Carte non reconnue")
+                    ctx.t.setCursorPos(2, 3); ctx.t.setTextColor(colors.red); ctx.t.write("Carte Inconnue")
+                end
             else
                 drawFooter(ctx, "Inserez carte ou choisissez")
                 addButton(ctx, "btn_log", "Se Connecter", 2, 5, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "login" end)
@@ -449,27 +464,18 @@ local function runAtmTerminal(target_term, target_name)
             local action = nil
             while not action do
                 local evType, p1, p2 = pullCtxEvent(ctx)
-                if evType == "tick" then drawHeader(ctx, "BankOS")
+                if evType == "tick" then 
+                    drawHeader(ctx, "BankOS")
+                elseif evType == "disk_change" then
+                    -- Re-détecte immédiatement l'insertion de carte
+                    break
                 elseif evType == "touch" then
                     local cb = handleTouch(ctx, p1, p2)
                     if cb then action = cb() end
                 end
             end
 
-            if action == "card_login" then
-                local cardAcc = getAccountByCard(rawCardId)
-                if cardAcc then
-                    local pinInput = getNumpadInput(ctx, "Code PIN Carte", true, true)
-                    if pinInput == bankData.accounts[cardAcc].pin then
-                        currentAccountName = cardAcc
-                    elseif pinInput then
-                        clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("PIN Incorrect"); sleep(1.5)
-                    end
-                else
-                    clr(ctx); drawHeader(ctx, "Erreur"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.red); ctx.t.write("Carte non reconnue"); sleep(1.5)
-                end
-
-            elseif action == "login" or action == "other" then
+            if action == "login" then
                 local nameInput = getAzertyInput(ctx, "ID Compte", true)
                 if nameInput then
                     local realAccountName = getAccountByName(nameInput)
@@ -506,36 +512,62 @@ local function runAtmTerminal(target_term, target_name)
 
         local function runDashboard()
             while true do
+                -- Vérifie si la carte insérée correspond toujours ou si elle a été retirée
+                local rawCardId = getInsertedCardId(ctx.drive)
+                if rawCardId and rawCardId ~= "UNLINKED" then
+                    local cardAcc = getAccountByCard(rawCardId)
+                    if cardAcc and cardAcc ~= currentAccountName then
+                        currentAccountName = cardAcc -- Mise à jour vers la nouvelle carte insérée
+                    end
+                end
+
                 local acc = bankData.accounts[currentAccountName]
                 clr(ctx); clearButtons(ctx)
                 
                 local btnW = ctx.w - 3
-                addButton(ctx, "dep", "+ Depot", 2, 6, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "depot" end)
-                addButton(ctx, "ret", "- Retrait", 2, 9, btnW, 2, (ctx.isColor and colors.orange or colors.white), colors.black, function() return "retrait" end)
-                addButton(ctx, "tra", "-> Transfert", 2, 12, btnW, 2, (ctx.isColor and colors.purple or colors.white), colors.white, function() return "transfert" end)
-                addButton(ctx, "his", "Historique", 2, 15, btnW, 1, (ctx.isColor and colors.lightBlue or colors.white), colors.black, function() return "history" end)
-                addButton(ctx, "crd", "Lier Carte", 2, 17, btnW, 1, (ctx.isColor and colors.yellow or colors.white), colors.black, function() return "card" end)
-                addButton(ctx, "quit", "Deconnexion", 2, 19, btnW, 1, (ctx.isColor and colors.red or colors.white), colors.white, function() return "logout" end)
+                
+                -- NOUVEAU BOUTON : Modifier PIN (placé tout en haut juste au-dessus du Solde)
+                addButton(ctx, "chpin", "Modifier PIN", 2, 2, btnW, 1, (ctx.isColor and colors.purple or colors.white), colors.white, function() return "change_pin" end)
+                
+                -- Boutons standards de transaction
+                addButton(ctx, "dep", "+ Depot", 2, 7, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "depot" end)
+                addButton(ctx, "ret", "- Retrait", 2, 10, btnW, 2, (ctx.isColor and colors.orange or colors.white), colors.black, function() return "retrait" end)
+                addButton(ctx, "tra", "-> Transfert", 2, 13, btnW, 2, (ctx.isColor and colors.purple or colors.white), colors.white, function() return "transfert" end)
+                addButton(ctx, "his", "Historique", 2, 16, btnW, 1, (ctx.isColor and colors.lightBlue or colors.white), colors.black, function() return "history" end)
+                addButton(ctx, "crd", "Lier Carte", 2, 18, btnW, 1, (ctx.isColor and colors.yellow or colors.white), colors.black, function() return "card" end)
+                addButton(ctx, "quit", "Deconnexion", 2, 20, btnW, 1, (ctx.isColor and colors.red or colors.white), colors.white, function() return "logout" end)
                 
                 drawButtons(ctx); drawFooter(ctx, "Bienvenue " .. currentAccountName)
 
+                -- AFFICHAGE DU SOLDE (Juste en-dessous du bouton Modifier PIN)
                 ctx.t.setBackgroundColor(colors.black)
-                for y = 3, 4 do ctx.t.setCursorPos(2, y); ctx.t.write(string.rep(" ", ctx.w - 2)) end
-                ctx.t.setCursorPos(3, 3); ctx.t.setTextColor(colors.lightGray); ctx.t.write("Solde :")
-                ctx.t.setCursorPos(3, 4); ctx.t.setTextColor(colors.green); ctx.t.write("$" .. string.format("%.2f", acc.balance))
+                for y = 4, 5 do ctx.t.setCursorPos(2, y); ctx.t.write(string.rep(" ", ctx.w - 2)) end
+                ctx.t.setCursorPos(3, 4); ctx.t.setTextColor(colors.lightGray); ctx.t.write("Solde :")
+                ctx.t.setCursorPos(3, 5); ctx.t.setTextColor(colors.green); ctx.t.write("$" .. string.format("%.2f", acc.balance))
 
                 while true do
                     drawHeader(ctx, currentAccountName)
                     local evType, p1, p2 = pullCtxEvent(ctx)
-                    if evType == "tick" then
-                        drawHeader(ctx, currentAccountName)
+                    
+                    if evType == "tick" or evType == "disk_change" then
+                        break -- Rafraîchit automatiquement le dashboard si la disquette ou le solde change
                     elseif evType == "touch" then
                         local cb = handleTouch(ctx, p1, p2)
                         if cb then
                             local a = cb()
                             if a == "logout" then return end
                             
-                            if a == "depot" then
+                            if a == "change_pin" then
+                                local newPin = getNumpadInput(ctx, "Nouveau PIN", true, true)
+                                if newPin then
+                                    bankData.accounts[currentAccountName].pin = newPin
+                                    saveData()
+                                    logTransaction(currentAccountName, "PIN modifie")
+                                    clr(ctx); drawHeader(ctx, "Succes"); ctx.t.setCursorPos(2,3); ctx.t.setTextColor(colors.lime); ctx.t.write("PIN mis a jour !"); sleep(1.5)
+                                end
+                                break
+
+                            elseif a == "depot" then
                                 local val = getNumpadInput(ctx, "Montant Depot", false, true)
                                 local amt = tonumber(val)
                                 if amt and amt > 0 then
@@ -609,7 +641,7 @@ local function runAtmTerminal(target_term, target_name)
                                 break
 
                             elseif a == "card" then
-                                local cId, side = getInsertedCardId()
+                                local cId, side = getInsertedCardId(ctx.drive)
                                 if side then
                                     local rawCardId = generateCardCode()
                                     local cardHash = hashCardCode(rawCardId)
@@ -666,7 +698,7 @@ local function runServerLogAndAPI()
     drawLogs()
 
     while true do
-        local ev, p1, p2, p3 = os.pullEvent()
+        local ev, p1, p2 = os.pullEvent()
         
         if ev == "bank_update" then 
             drawLogs()
@@ -710,7 +742,7 @@ local function runServerLogAndAPI()
 end
 
 -- ====================================================
--- LANCEMENT DU SYSTEME
+-- LANCEMENT DU SYSTEME AVEC DELECTON DE LECTEUR
 -- ====================================================
 loadData()
 
@@ -725,14 +757,17 @@ end)
 
 local monitors = {peripheral.find("monitor")}
 if #monitors == 0 then
-    table.insert(tasks, function() runAtmTerminal(term.native(), "computer") end)
+    table.insert(tasks, function() runAtmTerminal(term.native(), "computer", nil) end)
 else
     table.insert(tasks, runServerLogAndAPI)
-    for _, name in ipairs(peripheral.getNames()) do
+    
+    -- Association dynamique : Gauche -> drive_3, Droite -> drive_4
+    for idx, name in ipairs(peripheral.getNames()) do
         if peripheral.getType(name) == "monitor" then
             local m = peripheral.wrap(name)
             m.setTextScale(0.5)
-            table.insert(tasks, function() runAtmTerminal(m, name) end)
+            local assignedDrive = (idx == 1 and "drive_3") or (idx == 2 and "drive_4") or nil
+            table.insert(tasks, function() runAtmTerminal(m, name, assignedDrive) end)
         end
     end
 end
