@@ -1,11 +1,6 @@
 -- ====================================================
--- CONFIGURATION DES TERMINAUX (ÉCRANS & LECTEURS)
--- Modifie facilement tes paires écran/drive ici !
+-- BankOS - Système Bancaire Sécurisé & Multi-Terminaux
 -- ====================================================
-local TERMINALS_CONFIG = {
-    { monitor = "monitor_17", drive = "drive_3" }, -- Écran Gauche
-    { monitor = "monitor_16", drive = "drive_4" }, -- Écran Droit
-}
 
 local MASTER_KEY = "CraftBank_Secret_Key_2026"
 local dataFile = "bank_data.txt"
@@ -172,10 +167,22 @@ local function logTransaction(accountName, actionText)
 end
 
 -- ====================================================
--- 3. GESTION DES CARTES BANCAIRES ET DRIVE SPECIFIQUE
+-- 3. GESTION DES CARTES BANCAIRES ET DRIVE DYNAMIQUE
 -- ====================================================
 local function getInsertedCardId(assignedDrive)
-    local drives = assignedDrive and { assignedDrive } or { "drive_3", "drive_4", "top", "bottom", "left", "right", "front", "back" }
+    local drives = {}
+    if assignedDrive then
+        drives = { assignedDrive }
+    else
+        for _, name in ipairs(peripheral.getNames()) do
+            if peripheral.getType(name) == "drive" then
+                table.insert(drives, name)
+            end
+        end
+        for _, side in ipairs({"top", "bottom", "left", "right", "front", "back"}) do
+            table.insert(drives, side)
+        end
+    end
     
     for _, s in ipairs(drives) do
         if peripheral.isPresent(s) or disk.isPresent(s) then
@@ -528,9 +535,7 @@ local function runAtmTerminal(target_term, target_name, drive_name)
                 
                 local btnW = ctx.w - 3
                 
-                -- BOUTON : Modifier PIN au-dessus du solde
                 addButton(ctx, "chpin", "Modifier PIN", 2, 2, btnW, 1, (ctx.isColor and colors.purple or colors.white), colors.white, function() return "change_pin" end)
-                
                 addButton(ctx, "dep", "+ Depot", 2, 7, btnW, 2, (ctx.isColor and colors.green or colors.white), colors.black, function() return "depot" end)
                 addButton(ctx, "ret", "- Retrait", 2, 10, btnW, 2, (ctx.isColor and colors.orange or colors.white), colors.black, function() return "retrait" end)
                 addButton(ctx, "tra", "-> Transfert", 2, 13, btnW, 2, (ctx.isColor and colors.purple or colors.white), colors.white, function() return "transfert" end)
@@ -540,7 +545,6 @@ local function runAtmTerminal(target_term, target_name, drive_name)
                 
                 drawButtons(ctx); drawFooter(ctx, "Bienvenue " .. currentAccountName)
 
-                -- AFFICHAGE DU SOLDE
                 ctx.t.setBackgroundColor(colors.black)
                 for y = 4, 5 do ctx.t.setCursorPos(2, y); ctx.t.write(string.rep(" ", ctx.w - 2)) end
                 ctx.t.setCursorPos(3, 4); ctx.t.setTextColor(colors.lightGray); ctx.t.write("Solde :")
@@ -743,13 +747,12 @@ local function runServerLogAndAPI()
 end
 
 -- ====================================================
--- LANCEMENT DU SYSTEME AVEC CONFIGURATION
+-- LANCEMENT DU SYSTEME AVEC DETECTION DYNAMIQUE
 -- ====================================================
 loadData()
 
 local tasks = {}
 
--- Horloge système pour rafraîchir l'heure
 table.insert(tasks, function()
     while true do
         sleep(1)
@@ -757,19 +760,28 @@ table.insert(tasks, function()
     end
 end)
 
--- Affichage du terminal Serveur/Logs sur l'ordinateur principal
-table.insert(tasks, runServerLogAndAPI)
+local monitors = {peripheral.find("monitor")}
+if #monitors == 0 then
+    table.insert(tasks, function() runAtmTerminal(term.native(), "computer", nil) end)
+else
+    table.insert(tasks, runServerLogAndAPI)
+    
+    local availableDrives = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "drive" then
+            table.insert(availableDrives, name)
+        end
+    end
 
--- Lancement des terminaux selon la table TERMINALS_CONFIG du haut
-for _, cfg in ipairs(TERMINALS_CONFIG) do
-    if peripheral.isPresent(cfg.monitor) then
-        local m = peripheral.wrap(cfg.monitor)
-        m.setTextScale(0.5)
-        local monName = cfg.monitor
-        local drvName = cfg.drive
-        table.insert(tasks, function() runAtmTerminal(m, monName, drvName) end)
-    else
-        print("Attention : Moniteur introuvable : " .. cfg.monitor)
+    local monitorIdx = 0
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "monitor" then
+            monitorIdx = monitorIdx + 1
+            local m = peripheral.wrap(name)
+            m.setTextScale(0.5)
+            local assignedDrive = availableDrives[monitorIdx]
+            table.insert(tasks, function() runAtmTerminal(m, name, assignedDrive) end)
+        end
     end
 end
 
